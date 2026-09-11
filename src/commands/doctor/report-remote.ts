@@ -28,6 +28,7 @@ import {
   checkBatchRetryHealth,
   checkEmbeddingEnvOverride,
   checkEmbeddingMigrationState,
+  checkFactsEmbeddingWidthConsistency,
   checkSubagentCapability,
   checkVolunteerChannels,
   checkSyncFreshness,
@@ -346,6 +347,14 @@ export async function doctorReportRemote(
   // Surface the migration state marker (previously write-only): a live
   // marker = mid-migration brain, with the exact resume + status commands.
   checks.push(await checkEmbeddingMigrationState(engine));
+
+  // CUR-1556 cross-surface parity: facts.embedding column-width drift was
+  // invisible to the thin-client doctor while every `remember` write failed
+  // with a raw pgvector error. The check already existed in buildChecks()
+  // and in doctor-categories; it was simply never wired here, so MCP and
+  // other remote callers had no way to see it. Local doctor was fine --
+  // which is exactly why the drift survived three days of investigation.
+  checks.push(await checkFactsEmbeddingWidthConsistency(engine));
 
   // v0.31.12 subagent runtime enforcement (Layer 3 of 3 — Codex F13).
   // The subagent loop requires native tool-calling. If models.subagent,
