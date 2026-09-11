@@ -504,6 +504,14 @@ async function runPipelineWithBody(
   const { cosineSimilarity } = await import('./classify.ts');
   const { writeFactsToFence, lookupSourceLocalPath } = await import('./fence-write.ts');
 
+  // CUR-1556: fail fast BEFORE the LLM extraction call when facts.embedding's
+  // width disagrees with the gateway's dims -- otherwise we pay for extraction
+  // and then lose every insert to a raw pgvector error. This one seam covers
+  // the cycle extract_facts phase, the durable facts-absorb minion and the
+  // inline extract_facts op.
+  const { assertFactsEmbeddingDimMatchesConfig } = await import('../embedding-dim-check.ts');
+  await assertFactsEmbeddingDimMatchesConfig(ctx.engine);
+
   if (abortSignal?.aborted) {
     return { inserted: 0, duplicate: 0, superseded: 0, fact_ids: [], entity_slugs: [] };
   }
