@@ -81,6 +81,15 @@ export async function writeSingleFact(
   const { writeFactsToFence, lookupSourceLocalPath } = await import('./fence-write.ts');
   const { isAvailable, embedOne } = await import('../ai/gateway.ts');
 
+  // CUR-1556: refuse BEFORE the write when facts.embedding's width disagrees
+  // with the gateway's embedding dims. Without this, `remember` died on a raw
+  // pgvector "expected N dimensions, not M" with no fix attached; the tagged
+  // error carries the paste-ready ALTER recipe. The assert's own docstring
+  // claimed this seam was already covered -- it had exactly one call site (the
+  // extract-conversation-facts CLI) and the `remember` verb was not it.
+  const { assertFactsEmbeddingDimMatchesConfig } = await import('../embedding-dim-check.ts');
+  await assertFactsEmbeddingDimMatchesConfig(engine);
+
   const factText = input.fact.trim();
   const kind = input.kind ?? 'fact';
   const visibility = input.visibility ?? 'private';
