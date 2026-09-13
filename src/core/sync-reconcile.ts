@@ -72,6 +72,57 @@ export function planReconcileDeletes(
 }
 
 /**
+ * Outcome of gating stale rows on whether their CONTENT survived the tree.
+ */
+export interface RenamePartition {
+  /** Content is gone from the tree — a genuine deletion, safe to reconcile. */
+  deletable: string[];
+  /** Content survives at another path — a RENAME, never a deletion. */
+  renamedAway: string[];
+  /** Survival could not be determined — preserved, and surfaced to the caller. */
+  unprovable: string[];
+}
+
+/**
+ * Gate reconcile deletions on content survival, not path survival.
+ *
+ * The 2026-09-11 incident: a repository restructure MOVED 1,141 `.py` files.
+ * The ever-committed check (`listEverCommittedPaths`) runs `git log` with
+ * `--no-renames`, so every renamed-away path answered "yes, ever committed"
+ * and "absent from the current tree" — the exact signature of a genuine
+ * deletion. 1,139 pages were destroyed. Measured afterwards against the same
+ * commit range, only **50** of those paths were true deletions.
+ *
+ * A path is only a deletion if its CONTENT is gone. Blob identity is the
+ * primary gate because it survives renames, squashes and history rewrites in
+ * one predicate, where a rename ledger has to be threaded through each.
+ *
+ * `unprovable` rows are PRESERVED, never deleted. The asymmetry is deliberate:
+ * page deletes are a hard `DELETE FROM pages` with no soft-delete, and
+ * `page_versions` keys on `page_id`, so a wrong delete is unrecoverable from
+ * inside the system. A wrong keep is a stale row someone can clean up later.
+ *
+ * Pure: takes plain inputs, shells out to nothing, so the guard is testable
+ * without a working tree or an engine.
+ */
+export function partitionRenamedAway(
+  staleRows: ReadonlyArray<{ slug: string; source_path: string }>,
+  blobAtLastSync: ReadonlyMap<string, string>,
+  survivingBlobs: ReadonlySet<string>,
+): RenamePartition {
+  const deletable: string[] = [];
+  const renamedAway: string[] = [];
+  const unprovable: string[] = [];
+  for (const row of staleRows) {
+    const blob = blobAtLastSync.get(row.source_path);
+    if (blob === undefined) unprovable.push(row.slug);
+    else if (survivingBlobs.has(blob)) renamedAway.push(row.slug);
+    else deletable.push(row.slug);
+  }
+  return { deletable, renamedAway, unprovable };
+}
+
+/**
  * #2426: every repo-relative path that ever appeared as an ADD in git history
  * (rename detection off, so a `git mv` destination still counts as an add).
  * Used by the full-sync reconcile to distinguish "file was committed and later
