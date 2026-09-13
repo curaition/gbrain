@@ -253,6 +253,29 @@ export async function checkEmbeddingEnvOverride(engine: BrainEngine): Promise<Ch
   if (envDim && dbDim && envDim !== dbDim) {
     mismatches.push({ key: 'GBRAIN_EMBEDDING_DIMENSIONS', env: envDim, db: dbDim });
   }
+  // CUR-1556: an ABSENT DB value makes the comparison above vacuous -- the
+  // `&& dbModel` / `&& dbDim` guards can never fire, so this check returned
+  // a meaningless `ok` for every brain whose DB embedding rows were cleared
+  // (exactly what the v0.46 upgrade runbook's `config unset` step does).
+  // That silent pass is how facts.embedding sat at halfvec(1280) against a
+  // 1536-dim runtime while doctor reported healthy embeddings throughout.
+  const unverifiable: Array<{ key: string; env: string }> = [];
+  if (envModel && !dbModel) unverifiable.push({ key: 'GBRAIN_EMBEDDING_MODEL', env: envModel });
+  if (envDim && !dbDim) unverifiable.push({ key: 'GBRAIN_EMBEDDING_DIMENSIONS', env: envDim });
+  if (mismatches.length === 0 && unverifiable.length > 0) {
+    return {
+      name: 'embedding_env_override',
+      status: 'warn',
+      message:
+        `${unverifiable.length} embedding env var(s) set with NO DB config value to compare ` +
+        `against (${unverifiable.map((u) => u.key).join(', ')}) -- env alone defines the ` +
+        `embedding plane, so this check cannot verify agreement. Confirm the file plane ` +
+        `(~/.gbrain/config.json) matches, and see facts_embedding_width_consistency for ` +
+        `live column drift.`,
+      details: { unverifiable },
+    };
+  }
+
   if (mismatches.length === 0) {
     // Informational nuance (D10): agreeing env vars are still an override —
     // the file plane is the durable home; say so instead of a bare ok.

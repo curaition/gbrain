@@ -121,6 +121,28 @@ describe('embedding_env_override check (buildChecks seam)', () => {
     );
   });
 
+  // CUR-1556 — the hole that hid a production outage. The mismatch arms are
+  // gated `envModel && dbModel` / `envDim && dbDim`, so once the DB rows are
+  // cleared (what the v0.46 upgrade runbook's `config unset` step does) the
+  // check could never fire again and returned a meaningless `ok` forever.
+  test('env set but DB config absent -> warn, not a vacuous ok', async () => {
+    await withEnv(
+      {
+        GBRAIN_EMBEDDING_MODEL: 'openai:text-embedding-3-small',
+        GBRAIN_EMBEDDING_DIMENSIONS: '1536',
+      },
+      async () => {
+        const checks = await buildChecks(engine, []);
+        const check = findCheck(checks, 'embedding_env_override');
+        expect(check).toBeDefined();
+        expect(check!.status).toBe('warn');
+        expect(check!.message).toContain('NO DB config value');
+        const details = check!.details as { unverifiable: Array<{ key: string; env: string }> };
+        expect(details.unverifiable).toHaveLength(2);
+      },
+    );
+  });
+
   test('doctorReportRemote() includes the check (cross-surface parity)', async () => {
     await withEnv({ GBRAIN_EMBEDDING_MODEL: 'openai:something' }, async () => {
       await engine.setConfig('embedding_model', 'zeroentropyai:zembed-1');
@@ -140,6 +162,17 @@ describe('cross-surface parity (source-grep regression guard)', () => {
     const src = doctorSource();
     // The helper is called as `await checkEmbeddingEnvOverride(engine)`
     const matches = src.match(/await checkEmbeddingEnvOverride\(engine\)/g) ?? [];
+    expect(matches.length).toBeGreaterThanOrEqual(2);
+  });
+
+  // CUR-1556: facts_embedding_width_consistency existed in buildChecks() and in
+  // doctor-categories, but was never wired into doctorReportRemote -- so the
+  // thin-client/MCP surface could not see facts.embedding column drift while
+  // every `remember` write failed with a raw pgvector error. Same asymmetry
+  // class the test above guards for embedding_env_override.
+  test('doctor.ts wires checkFactsEmbeddingWidthConsistency into BOTH buildChecks and doctorReportRemote', () => {
+    const src = doctorSource();
+    const matches = src.match(/await checkFactsEmbeddingWidthConsistency\(engine\)/g) ?? [];
     expect(matches.length).toBeGreaterThanOrEqual(2);
   });
 });
