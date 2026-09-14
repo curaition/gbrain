@@ -118,6 +118,10 @@ import {
   massReconcileAllowed,
   resolveStallAbortSeconds,
   composeAbortSignals,
+  evaluateDeleteValve,
+  formatDeleteValveRefusal,
+  parseAllowDeletes,
+  type DeleteValveVerdict,
 } from '../core/sync-reconcile.ts';
 
 /**
@@ -218,7 +222,7 @@ export function shouldNudgeAfterSync(status: SyncResult['status']): boolean {
 }
 
 export interface SyncResult {
-  status: 'up_to_date' | 'synced' | 'first_sync' | 'dry_run' | 'blocked_by_failures' | 'partial';
+  status: 'up_to_date' | 'synced' | 'first_sync' | 'dry_run' | 'blocked_by_failures' | 'partial' | 'refused_mass_delete';
   fromCommit: string | null;
   toCommit: string;
   added: number;
@@ -230,6 +234,13 @@ export interface SyncResult {
   embedded: number;
   pagesAffected: string[];
   failedFiles?: number; // count of parse failures (Bug 9)
+  /**
+   * W2.1 delete valve verdict, present when the valve had something to say:
+   * status `refused_mass_delete` (incremental path refused the whole run),
+   * a full sync whose reconcile deletes were skipped, or a run that went
+   * through on `--allow-deletes`. See sync-reconcile.ts.
+   */
+  deleteValve?: DeleteValveVerdict;
   /**
    * #3875: code breakdown of the blocking failures (set on
    * `blocked_by_failures` only). Lets printSyncResult (and --json consumers)
@@ -314,6 +325,12 @@ export interface SyncOpts {
    * Threaded through performSync AND syncOneSource so `sync --all` honors it.
    */
   noSchemaPack?: boolean;
+  /**
+   * W2.1 (2026-09-14): `--allow-deletes <N>` — the ONLY way past the delete
+   * valve. N must be at least the number of pages the run wants to delete;
+   * a smaller N refuses again. Per invocation, never an environment variable.
+   */
+  allowDeletes?: number;
   /**
    * v0.18.0 Step 5 — sync a specific named source. When set, sync reads
    * local_path + last_commit from the sources table (not the global
@@ -544,6 +561,20 @@ See also:
 // runBreakLock, buildPartialResult) was peeled to src/core/sync-lock.ts
 // (pure move). Re-exported so existing importers keep working.
 export { SyncLockBusyError, runBreakLock } from '../core/sync-lock.ts';
+
+/**
+ * W2.1: the delete valve's denominator — live pages of the source, whatever
+ * their type or file-backing. Always defined, unlike #2828's file-backed count
+ * (zero for a code source after the W1.2 split). One cheap COUNT, taken at
+ * decision time so the ratio reflects the brain the deletes would hit.
+ */
+async function countLivePages(engine: BrainEngine, sourceId: string): Promise<number> {
+  const rows = await engine.executeRaw<{ n: number | string }>(
+    `SELECT count(*)::int AS n FROM pages WHERE source_id = $1 AND deleted_at IS NULL`,
+    [sourceId],
+  );
+  return Number(rows[0]?.n ?? 0);
+}
 
 export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<SyncResult> {
   // v0.22.13 CODEX-2: cross-process writer lock prevents two concurrent
@@ -1333,6 +1364,48 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       embedded: 0,
       pagesAffected: [],
     };
+  }
+
+  // W2.1 delete valve — BEFORE the first write of this run. Until 2026-09-14
+  // the incremental path had no valve: whatever `git diff --name-status -M`
+  // listed as deleted went to a batched HARD delete (`DELETE FROM pages`), and
+  // a rename wave read as removals destroyed 1,139 pages on 2026-09-11. The
+  // whole run is refused, not just the deletes: a delta that imports adds and
+  // modifies but skips its deletes would either advance the bookmark past a
+  // deletion list that was never applied (silently lost) or never advance at
+  // all (every later run redoes everything). Refusing everything keeps the
+  // bookmark where it was; the operator re-runs with the count.
+  if (filtered.deleted.length > 0) {
+    const valveSourceId = opts.sourceId ?? 'default';
+    const verdict = evaluateDeleteValve({
+      requested: filtered.deleted.length,
+      population: await countLivePages(engine, valveSourceId),
+      allowDeletes: opts.allowDeletes,
+    });
+    if (!verdict.allowed) {
+      serr(formatDeleteValveRefusal(verdict, { sourceId: valveSourceId, path: 'incremental' }));
+      return {
+        status: 'refused_mass_delete',
+        malformedSkipped: malformedSkipped.length,
+        fromCommit: lastCommit,
+        toCommit: headCommit,
+        added: filtered.added.length,
+        modified: filtered.modified.length,
+        deleted: filtered.deleted.length,
+        renamed: filtered.renamed.length,
+        chunksCreated: 0,
+        embedded: 0,
+        pagesAffected: [],
+        deleteValve: verdict,
+      };
+    }
+    if (verdict.overridden) {
+      serr(
+        `[sync] delete valve OVERRIDDEN by --allow-deletes ${verdict.allowDeletes}: ` +
+        `deleting ${verdict.requested} of ${verdict.population} live page(s) in source '${valveSourceId}' ` +
+        `(limit that would have refused: ${verdict.reason}).`,
+      );
+    }
   }
 
   // Delete pages that became un-syncable (modified but filtered out).
@@ -2935,6 +3008,8 @@ async function performFullSync(
   // Skipped on the legacy no-sourceId path (the batch delete primitives require
   // a sourceId; matches every other source-scoped feature).
   let reconciledDeletes = 0;
+  // W2.1: set when the delete valve refused or was overridden this run.
+  let fullSyncDeleteValve: DeleteValveVerdict | undefined;
   if (opts.sourceId) {
     const sid = opts.sourceId;
     const reconcileSyncOpts = opts.strategy ? { strategy: opts.strategy } : undefined;
@@ -3037,6 +3112,30 @@ async function performFullSync(
           `so the next sync sees them as file-backed.`,
         );
       }
+      // W2.1 delete valve — second gate after #2828 and the ever-committed
+      // filter, sized against LIVE pages (always defined) with no environment
+      // override. A full sync is stateless — the next one re-detects the same
+      // stale rows — so refusing here skips the deletes and lets the rest of
+      // the sync continue, exactly as #2828 does.
+      if (deletableSlugs.length > 0) {
+        const verdict = evaluateDeleteValve({
+          requested: deletableSlugs.length,
+          population: await countLivePages(engine, sid),
+          allowDeletes: opts.allowDeletes,
+        });
+        if (!verdict.allowed) {
+          serr(formatDeleteValveRefusal(verdict, { sourceId: sid, path: 'full' }));
+          fullSyncDeleteValve = verdict;
+          deletableSlugs = [];
+        } else if (verdict.overridden) {
+          serr(
+            `[sync] delete valve OVERRIDDEN by --allow-deletes ${verdict.allowDeletes}: ` +
+            `reconcile-deleting ${verdict.requested} of ${verdict.population} live page(s) in source '${sid}' ` +
+            `(limit that would have refused: ${verdict.reason}).`,
+          );
+          fullSyncDeleteValve = verdict;
+        }
+      }
       const deleteScopedOpts = { sourceId: sid };
       // Malformed-path rows get their own line: unlike genuinely-deleted
       // files, THEIR backing file is usually still on disk (the walker
@@ -3102,6 +3201,7 @@ async function performFullSync(
     modified: 0,
     deleted: reconciledDeletes,
     renamed: 0,
+    ...(fullSyncDeleteValve ? { deleteValve: fullSyncDeleteValve } : {}),
     chunksCreated: result.chunksCreated,
     embedded,
     pagesAffected: [],
@@ -3124,6 +3224,13 @@ export {
   planReconcileDeletes,
   listEverCommittedPaths,
   massReconcileAllowed,
+  DELETE_VALVE_ABSOLUTE_CAP,
+  DELETE_VALVE_RATIO,
+  DELETE_VALVE_MIN_POPULATION,
+  type DeleteValveVerdict,
+  evaluateDeleteValve,
+  parseAllowDeletes,
+  formatDeleteValveRefusal,
   HARD_DEADLINE_GRACE_SEC,
   type HardDeadlineResolution,
   DEFAULT_SYNC_STALL_ABORT_SEC,
@@ -3188,6 +3295,11 @@ Options:
                        Forces a full filesystem walk so periodic syncs see
                        ignored untracked content.
   --dry-run            Show what would be synced without writing.
+  --allow-deletes N    Let this run delete up to N pages from a source. Without
+                       it a run that would delete more than 100 pages, or more
+                       than 25% of a source's live pages, is refused (W2.1
+                       delete valve). N must cover the full count; there is no
+                       environment override.
   --skip-failed        Acknowledge previously-recorded sync failures so
                        the bookmark can advance past unparseable files.
   --retry-failed       Re-attempt previously-failed files; clear on success.
@@ -3424,6 +3536,17 @@ See also:
   } catch (e) {
     console.error(e instanceof Error ? e.message : String(e));
     process.exit(1);
+  }
+  // W2.1: `--allow-deletes <N>` — the delete valve's only override. Parsed
+  // strictly: a bare flag or a non-integer is an error, never "no override".
+  let allowDeletes: number | undefined;
+  if (args.includes('--allow-deletes')) {
+    try {
+      allowDeletes = parseAllowDeletes(args.find((a, i) => args[i - 1] === '--allow-deletes'));
+    } catch (e) {
+      console.error(e instanceof Error ? e.message : String(e));
+      process.exit(1);
+    }
   }
   const explicitSourceArg = args.find((a, i) => args[i - 1] === '--source');
   if (timeoutSeconds !== undefined && !syncAll && !explicitSourceArg) {
@@ -3691,6 +3814,7 @@ See also:
         noExtract,
         skipFailed, retryFailed, noSchemaPack,
         includeGitignored,
+        allowDeletes,
         sourceId: src.id,
         strategy: cfg.strategy,
         concurrency,
@@ -3717,6 +3841,7 @@ See also:
       if (
         result.status !== 'dry_run' &&
         result.status !== 'blocked_by_failures' &&
+        result.status !== 'refused_mass_delete' &&
         result.status !== 'partial'
       ) {
         manageGitignoreAtGitRoot(src.local_path!, engine.kind);
@@ -3923,6 +4048,7 @@ See also:
   const onSingleSourceSigint = () => { try { singleSourceInterrupt.abort(new Error('SIGINT')); } catch { /* */ } };
   const opts: SyncOpts = {
     repoPath, dryRun, full, noPull, noEmbed, noExtract, skipFailed, retryFailed, noSchemaPack, includeGitignored, sourceId,
+    allowDeletes,
     strategy: strategyArg, concurrency,
     srcSubpath,
     exclude: excludePatterns.length > 0 ? excludePatterns : undefined,
@@ -4015,6 +4141,7 @@ See also:
     if (
       result.status !== 'dry_run' &&
       result.status !== 'blocked_by_failures' &&
+      result.status !== 'refused_mass_delete' &&
       result.status !== 'partial'
     ) {
       const effectiveRepoPath = opts.repoPath ?? (await getDefaultSourcePath(engine));
@@ -4064,6 +4191,7 @@ See also:
       if (
         result.status !== 'dry_run' &&
         result.status !== 'blocked_by_failures' &&
+        result.status !== 'refused_mass_delete' &&
         result.status !== 'partial'
       ) {
         const effectiveRepoPath = opts.repoPath ?? (await getDefaultSourcePath(engine));
@@ -4219,6 +4347,8 @@ export async function syncOneSource(
     /** v0.42.7 #1696: propagate --no-extract into every per-source sync. */
     noExtract?: boolean;
     includeGitignored?: boolean;
+    /** W2.1: propagate `--allow-deletes <N>` into every per-source sync. */
+    allowDeletes?: number;
   },
 ): Promise<{ result: SyncResult; log: string }> {
   const cfg = (src.config || {}) as { strategy?: 'markdown' | 'code' | 'auto' };
@@ -4234,6 +4364,7 @@ export async function syncOneSource(
     retryFailed: shared.retryFailed,
     noSchemaPack: shared.noSchemaPack,
     includeGitignored: shared.includeGitignored,
+    allowDeletes: shared.allowDeletes,
     sourceId: src.id,
     strategy: cfg.strategy,
     concurrency: shared.concurrency,
@@ -4467,6 +4598,19 @@ export function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = p
       break;
     case 'dry_run':
       break; // already printed in performSync
+    case 'refused_mass_delete': {
+      const v = result.deleteValve;
+      write(
+        `Sync REFUSED at ${result.toCommit.slice(0, 8)}: it would delete ` +
+        `${v?.requested ?? result.deleted} of ${v?.population ?? '?'} live page(s) ` +
+        `(limit: ${v?.reason ?? 'delete valve'}). Nothing was written; the bookmark did not move.`,
+      );
+      write(
+        `  If the removal is intended, re-run with --allow-deletes ${v?.requested ?? result.deleted}. ` +
+        `Otherwise check the repo path and whether a rename wave is being read as deletions.`,
+      );
+      break;
+    }
     case 'blocked_by_failures': {
       write(`Sync BLOCKED at ${result.toCommit.slice(0, 8)}: ${result.failedFiles ?? 0} file(s) failed.`);
       write(`  See ~/.gbrain/sync-failures.jsonl for details, or run 'gbrain doctor'.`);

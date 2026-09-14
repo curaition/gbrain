@@ -175,6 +175,19 @@ vars — incident-time escape hatches, not everyday knobs.
    `kind: "import"` so downstream tools can validate the contract before
    deciding whether to resume.
 
+7. **A sync that would delete a lot is refused, not trusted.** Sync deletes
+   are permanent (`DELETE FROM pages`, no soft-delete). A run that would
+   delete more than 100 pages from one source, or more than 25% of that
+   source's live pages, is refused before its first write and the bookmark
+   stays put; a full sync skips the deletes and continues. The usual cause is
+   not a real bulk removal: a wrong repo path, a path-comparison bug, or a
+   rename wave that the diff read as deletions (2026-09-11: 1,141 moved files
+   read as 1,139 deletions). If the removal is genuinely intended, re-run
+   with `--allow-deletes <N>` where N is the number of pages you expect to
+   lose; a smaller N refuses again. There is deliberately no environment
+   variable that switches this off. (`GBRAIN_ALLOW_MASS_RECONCILE=1` still
+   relaxes the older full-sync ratio check, and nothing else.)
+
 ## How to Verify
 
 1. **Edit a file and search for the change.** Edit a brain markdown file,
