@@ -161,6 +161,136 @@ export function massReconcileAllowed(
   return env.GBRAIN_ALLOW_MASS_RECONCILE === '1';
 }
 
+// ---------------------------------------------------------------------------
+// W2.1 delete valve (curaition remediation, 2026-09-14) — one valve in front of
+// EVERY bulk delete path, sized against a denominator that always exists.
+//
+// Why a second valve when #2828 already exists:
+//   * #2828 guards ONLY performFullSync's reconcile. The incremental (delta)
+//     path — `git diff --name-status -M` deletions → batched hard
+//     `engine.deletePages` — had no valve of any kind.
+//   * #2828 divides by the source's FILE-BACKED page count. After the
+//     2026-09-13 W1.2 split, a code source's file-backed population is zero by
+//     construction (survivors carry source_path NULL), so that ratio has no
+//     denominator. This valve divides by the source's LIVE page count.
+//   * #2828 is switched off by one persistent environment variable. A service
+//     that sets it once has no valve forever. This valve has NO environment
+//     override: the only way past it is `--allow-deletes <N>` on the invocation,
+//     where N is the number the operator expects to remove. A wrong N refuses.
+//
+// The 2026-09-11 incident replayed against these thresholds: the run wanted
+// 1,160 deletions out of ~4,500 live pages → refused twice over (cap 100,
+// ratio 25.8% > 25%). The 50 genuine deletions in the same range → allowed
+// (50 ≤ 100, 1.1%).
+//
+// Sync deletes are HARD (`DELETE FROM pages`, no soft-delete, page_versions
+// keyed on page_id), so a wrong delete is unrecoverable from inside the
+// system and a wrong refusal costs one re-run with the flag. The asymmetry
+// picks refusal.
+// ---------------------------------------------------------------------------
+
+/** Most pages one sync run may delete from one source without `--allow-deletes`. */
+export const DELETE_VALVE_ABSOLUTE_CAP = 100;
+/** Fraction of a source's live pages one run may delete without `--allow-deletes`. */
+export const DELETE_VALVE_RATIO = 0.25;
+/** Sources at or below this many live pages are judged by the absolute cap only. */
+export const DELETE_VALVE_MIN_POPULATION = 20;
+
+export type DeleteValveReason = 'absolute_cap' | 'ratio';
+
+export interface DeleteValveVerdict {
+  /** True when the deletes may proceed (nothing to do, within limits, or overridden). */
+  allowed: boolean;
+  /** Pages the run wants to delete. */
+  requested: number;
+  /** Live pages of the source at decision time (the ratio denominator). */
+  population: number;
+  /** Why the limits would refuse, or null when within limits. Set even when overridden. */
+  reason: DeleteValveReason | null;
+  /** True when limits would refuse but `--allow-deletes N` (N ≥ requested) let it through. */
+  overridden: boolean;
+  /** The `--allow-deletes` value in force, if any. */
+  allowDeletes?: number;
+}
+
+/**
+ * Decide whether a bulk delete may proceed. Pure: takes counts, reads no
+ * engine and no environment, so every branch is unit-testable and the
+ * incident can be replayed as a test.
+ */
+export function evaluateDeleteValve(input: {
+  requested: number;
+  population: number;
+  allowDeletes?: number;
+}): DeleteValveVerdict {
+  const requested = Math.max(0, Math.floor(input.requested));
+  const population = Math.max(0, Math.floor(input.population));
+  const allowDeletes = input.allowDeletes;
+  let reason: DeleteValveReason | null = null;
+  if (requested > DELETE_VALVE_ABSOLUTE_CAP) {
+    reason = 'absolute_cap';
+  } else if (
+    population > DELETE_VALVE_MIN_POPULATION &&
+    requested > population * DELETE_VALVE_RATIO
+  ) {
+    reason = 'ratio';
+  }
+  if (requested === 0 || reason === null) {
+    return { allowed: true, requested, population, reason, overridden: false, allowDeletes };
+  }
+  const overridden = allowDeletes !== undefined && allowDeletes >= requested;
+  return { allowed: overridden, requested, population, reason, overridden, allowDeletes };
+}
+
+/**
+ * Parse `--allow-deletes <N>`. A positive integer, or an error naming the
+ * flag — a malformed value must not silently read as "no override".
+ */
+export function parseAllowDeletes(raw: string | undefined): number {
+  if (raw === undefined || !/^\d+$/.test(raw) || Number(raw) < 1) {
+    throw new Error(
+      `--allow-deletes requires a positive integer: the number of pages you expect this run to delete` +
+      (raw === undefined ? '' : ` (got ${JSON.stringify(raw)})`),
+    );
+  }
+  return Number(raw);
+}
+
+/**
+ * The refusal message, on stderr and in the result. States the numbers, the
+ * limit that fired, and the exact re-run that would be accepted — the operator
+ * must type the count, so a path-comparison bug that "deletes" the whole
+ * source cannot be waved through with a boolean.
+ */
+export function formatDeleteValveRefusal(
+  verdict: DeleteValveVerdict,
+  ctx: { sourceId: string; path: 'incremental' | 'full' },
+): string {
+  const pct = verdict.population > 0
+    ? `${((verdict.requested / verdict.population) * 100).toFixed(1)}%`
+    : 'n/a';
+  const limit = verdict.reason === 'absolute_cap'
+    ? `more than ${DELETE_VALVE_ABSOLUTE_CAP} pages in one run`
+    : `more than ${Math.round(DELETE_VALVE_RATIO * 100)}% of the source's live pages`;
+  const consequence = ctx.path === 'incremental'
+    ? `Nothing was written: adds, modifies and renames are held back with the deletes so the\n` +
+      `  bookmark does not advance past a deletion list that was never applied.`
+    : `No pages were deleted; the rest of the full sync continued. The next full sync will\n` +
+      `  see the same stale pages.`;
+  const flagNote = verdict.allowDeletes !== undefined
+    ? `\n  --allow-deletes ${verdict.allowDeletes} was given but is below the requested ${verdict.requested}.`
+    : '';
+  return (
+    `\n  REFUSED: the ${ctx.path} sync for source '${ctx.sourceId}' wants to delete ` +
+    `${verdict.requested} of ${verdict.population} live page(s) (${pct}) — ${limit}.\n` +
+    `  Sync deletes are permanent. Deleting this many at once is almost always a wrong repo\n` +
+    `  path, a rename wave read as removals, or a path-comparison bug — not a real bulk removal.\n` +
+    `  ${consequence}${flagNote}\n` +
+    `  If this removal is genuinely intended, re-run with --allow-deletes ${verdict.requested}\n` +
+    `  (the exact number; a smaller number refuses again). There is no environment override.`
+  );
+}
+
 /**
  * Grace window (seconds) between the watchdog's SIGTERM and SIGKILL. SIGTERM
  * gives a responsive loop a clean shutdown; SIGKILL is the starvation backstop.

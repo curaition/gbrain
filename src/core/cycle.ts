@@ -1273,7 +1273,7 @@ async function runPhaseSync(
     const pullFailedPartial = result.status === 'partial' && result.reason === 'pull_failed';
     return {
       phase: 'sync',
-      status: result.status === 'blocked_by_failures' || pullFailedPartial ? 'warn' : 'ok',
+      status: result.status === 'blocked_by_failures' || result.status === 'refused_mass_delete' || pullFailedPartial ? 'warn' : 'ok',
       duration_ms: 0,
       summary: dryRun
         ? `${syncedCount} page(s) would sync, ${result.deleted} would delete`
