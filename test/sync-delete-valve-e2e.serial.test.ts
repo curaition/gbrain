@@ -198,3 +198,58 @@ describe('W2.1 delete valve — full-sync reconcile', () => {
     expect(await livePages()).toBe(5);
   });
 });
+
+describe('W2.4 honest delete counter — rows actually removed, on every route', () => {
+  test('a diff that lists 3 deletions but only 2 rows exist reports 2, and says so in ingest_log', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const files = notes(30);
+    const repo = mkRepo(files);
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    // One page vanishes out of band (an MCP delete, a purge) — the diff will
+    // still list its file when the file is removed, but there is no row to
+    // delete. The pre-W2.4 summary would have reported the diff's 3.
+    await engine.executeRaw(`DELETE FROM pages WHERE source_id = 'default' AND slug = 'notes/n0000'`);
+    expect(await livePages()).toBe(29);
+    removeFirst(repo, files, 3);
+    commitAll(repo, 'remove 3');
+    const r = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(r.status).toBe('synced');
+    expect(r.deleted).toBe(3);      // what the diff listed
+    expect(r.deletedRows).toBe(2);  // what actually happened
+    expect(await livePages()).toBe(27);
+    const log = await engine.executeRaw<{ summary: string }>(
+      `SELECT summary FROM ingest_log WHERE source_type = 'git_sync' ORDER BY id DESC LIMIT 1`,
+    );
+    expect(log[0].summary).toContain('-2');
+    expect(log[0].summary).toContain('(diff listed 3 deletions)');
+  });
+
+  test('the reported number equals the real change in the live count', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const files = notes(30);
+    const repo = mkRepo(files);
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    const before = await livePages();
+    removeFirst(repo, files, 4);
+    commitAll(repo, 'remove 4');
+    const r = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(r.deletedRows).toBe(before - (await livePages()));
+    const log = await engine.executeRaw<{ summary: string }>(
+      `SELECT summary FROM ingest_log WHERE source_type = 'git_sync' ORDER BY id DESC LIMIT 1`,
+    );
+    expect(log[0].summary).toContain('-4 ');
+    expect(log[0].summary).not.toContain('diff listed');
+  });
+
+  test('a refused run reports zero rows removed', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const files = notes(30);
+    const repo = mkRepo(files);
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    removeFirst(repo, files, 25);
+    commitAll(repo, 'remove 25');
+    const r = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(r.status).toBe('refused_mass_delete');
+    expect(r.deletedRows).toBe(0);
+  });
+});

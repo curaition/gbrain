@@ -188,6 +188,19 @@ vars — incident-time escape hatches, not everyday knobs.
    variable that switches this off. (`GBRAIN_ALLOW_MASS_RECONCILE=1` still
    relaxes the older full-sync ratio check, and nothing else.)
 
+8. **An absolute page floor catches what ratios cannot.** `gbrain doctor` (and the
+   remote `run_doctor`) carries a `page_floor` check: each source's live page
+   count against a floor in the config row `doctor.page_floors`, a JSON object
+   of source id → minimum live pages. Below the floor the check FAILS; with no
+   floors set it WARNS, because a brain that just lost a thousand pages still
+   scores 100% on every ratio. Set floors at about 90% of today's live count
+   and raise them as sources grow (never lower them without a reason you can
+   write down):
+   `gbrain config set doctor.page_floors '{"default": 4105, "docs": 77}'`.
+   The sync result and its `ingest_log` summary now report the rows a run
+   actually removed (`deletedRows`), not the number of deletions the diff
+   listed; when the two differ the summary says so.
+
 ## How to Verify
 
 1. **Edit a file and search for the change.** Edit a brain markdown file,

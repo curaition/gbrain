@@ -166,6 +166,13 @@ export async function doctorReportRemote(
     checks.push(await pagesUpsertArbiterCheck(engine));
   }
 
+  // 2d. W2.2: absolute per-source page floor, scoped to the caller's grant so
+  // a source-bound client never learns another source's counts.
+  {
+    const { pageFloorCheck } = await import('./checks/core-health.ts');
+    checks.push(await pageFloorCheck(engine, { sourceIds: opts.sourceIds }));
+  }
+
   // v0.42.x — Life Chronicle (#2390): orphaned event projections. Reads already
   // hide projections whose event page is soft-deleted (read-time correctness);
   // this always-run probe surfaces the cleanup backlog. Keyed off the real

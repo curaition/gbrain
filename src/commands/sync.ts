@@ -242,6 +242,15 @@ export interface SyncResult {
    */
   deleteValve?: DeleteValveVerdict;
   /**
+   * W2.4 (2026-09-14) honest delete counter: page rows this run ACTUALLY
+   * removed, summed at every delete site (batched diff deletes, their per-slug
+   * fallback, un-syncable cleanup, rename stale-row reconcile, full-sync
+   * reconcile). `deleted` is what the diff LISTED; the two differ when a
+   * listed path had no row, was refused as foreign-origin, or the run stopped
+   * early. The ingest_log summary and the printed result report this number.
+   */
+  deletedRows?: number;
+  /**
    * #3875: code breakdown of the blocking failures (set on
    * `blocked_by_failures` only). Lets printSyncResult (and --json consumers)
    * distinguish provider-infra failures (EMBEDDING_TIMEOUT / RATE_LIMIT /
@@ -1366,6 +1375,11 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     };
   }
 
+  // W2.4: rows actually removed this run, counted at every delete site. Hard
+  // deletes leave no row behind to count afterwards, so this is the only
+  // honest tally. Declared before the first delete site (un-syncable cleanup).
+  let deletedRows = 0;
+
   // W2.1 delete valve — BEFORE the first write of this run. Until 2026-09-14
   // the incremental path had no valve: whatever `git diff --name-status -M`
   // listed as deleted went to a batched HARD delete (`DELETE FROM pages`), and
@@ -1396,6 +1410,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         chunksCreated: 0,
         embedded: 0,
         pagesAffected: [],
+        deletedRows: 0,
         deleteValve: verdict,
       };
     }
@@ -1459,6 +1474,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       const existing = await engine.getPage(slug, pageOpts);
       if (existing) {
         await engine.deletePage(slug, pageOpts);
+        deletedRows++;
         slog(`  Deleted un-syncable page: ${slug}`);
       }
     } catch { /* ignore */ }
@@ -1643,19 +1659,22 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       `[sync] banked ${banked} file(s) this run; next 'gbrain sync' resumes from ` +
       `the checkpoint (last_commit unchanged at ${(lastCommit ?? '').slice(0, 8)}).`,
     );
-    return buildPartialResult({
-      fromCommit: lastCommit,
-      toCommit: pin,
-      filesImported,
-      pagesAffected: [...pagesAffected],
-      chunksCreated,
-      added: filtered.added.length,
-      modified: filtered.modified.length,
-      deleted: filtered.deleted.length,
-      renamed: filtered.renamed.length,
-      reason: checkpointDead ? 'checkpoint_unavailable' : reason,
-      bankedFiles,
-    });
+    return {
+      ...buildPartialResult({
+        fromCommit: lastCommit,
+        toCommit: pin,
+        filesImported,
+        pagesAffected: [...pagesAffected],
+        chunksCreated,
+        added: filtered.added.length,
+        modified: filtered.modified.length,
+        deleted: filtered.deleted.length,
+        renamed: filtered.renamed.length,
+        reason: checkpointDead ? 'checkpoint_unavailable' : reason,
+        bankedFiles,
+      }),
+      deletedRows,
+    };
   };
 
   // v0.42.x (#1794): the pin write IS the mint of this run's checkpoint. If it
@@ -1787,6 +1806,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           // slugs (paths in filtered.deleted but with no DB row) so
           // downstream extract/embed don't waste lookups.
           pagesAffected.push(...deleted);
+          deletedRows += deleted.length;
           for (const s of deleted) deletedSlugs.add(s);
           // v0.42.x (#1794): the whole batch is handled (deleted, already
           // gone, or refused above); checkpoint every path so a resume skips it.
@@ -1800,6 +1820,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
             try {
               await engine.deletePage(slugs[j], deleteScopedOpts);
               pagesAffected.push(slugs[j]);
+              deletedRows++;
               deletedSlugs.add(slugs[j]);
               await markCompleted(deletable[j]);
             } catch (perSlugErr) {
@@ -1987,6 +2008,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
             if (staleSlug !== undefined && staleSlug !== newSlug) {
               await engine.deletePage(staleSlug, renameOpts);
               deletedSlugs.add(staleSlug); // never hand a deleted slug to auto-embed
+              deletedRows++;
               serr(`  [sync] rename reconciled: removed stale row ${staleSlug} (${from} -> ${to} fell back to add).`);
             } else if (staleSlug === undefined) {
               serr(`  [sync] rename fallback: no row has source_path ${from}; stale row (if any) left in place.`);
@@ -2549,6 +2571,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       added: filtered.added.length,
       modified: filtered.modified.length,
       deleted: filtered.deleted.length,
+      deletedRows,
       renamed: filtered.renamed.length,
       chunksCreated,
       embedded: 0,
@@ -2592,7 +2615,12 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       source_type: 'git_sync',
       source_ref: `${repoPath} @ ${headCommit.slice(0, 8)}`,
       pages_updated: pagesAffected,
-      summary: `Sync: +${filtered.added.length} ~${filtered.modified.length} -${filtered.deleted.length} R${filtered.renamed.length}, ${chunksCreated} chunks, ${elapsed}ms`,
+      // W2.4: the delete figure is rows actually removed, not the diff's list.
+      // On 2026-09-11 a summary of "-2" sat next to 1,139 destroyed pages.
+      summary:
+        `Sync: +${filtered.added.length} ~${filtered.modified.length} -${deletedRows} R${filtered.renamed.length}` +
+        (deletedRows !== filtered.deleted.length ? ` (diff listed ${filtered.deleted.length} deletions)` : '') +
+        `, ${chunksCreated} chunks, ${elapsed}ms`,
     });
   }
 
@@ -2798,6 +2826,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     added: filtered.added.length,
     modified: filtered.modified.length,
     deleted: filtered.deleted.length,
+    deletedRows,
     renamed: filtered.renamed.length,
     chunksCreated,
     embedded,
@@ -3200,6 +3229,7 @@ async function performFullSync(
     added: result.imported,
     modified: 0,
     deleted: reconciledDeletes,
+    deletedRows: reconciledDeletes,
     renamed: 0,
     ...(fullSyncDeleteValve ? { deleteValve: fullSyncDeleteValve } : {}),
     chunksCreated: result.chunksCreated,
@@ -4589,7 +4619,14 @@ export function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = p
       break;
     case 'synced':
       write(`Synced ${result.fromCommit?.slice(0, 8)}..${result.toCommit.slice(0, 8)}:`);
-      write(`  +${result.added} added, ~${result.modified} modified, -${result.deleted} deleted, R${result.renamed} renamed`);
+      write(
+        `  +${result.added} added, ~${result.modified} modified, ` +
+        `-${result.deletedRows ?? result.deleted} deleted` +
+        (result.deletedRows !== undefined && result.deletedRows !== result.deleted
+          ? ` (diff listed ${result.deleted})`
+          : '') +
+        `, R${result.renamed} renamed`,
+      );
       write(`  ${result.chunksCreated} chunks created${result.embedded > 0 ? `, ${result.embedded} pages embedded` : ''}`);
       break;
     case 'first_sync':

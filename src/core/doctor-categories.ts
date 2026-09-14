@@ -55,6 +55,8 @@ export type CheckCategory = 'brain' | 'skill' | 'ops' | 'meta';
  * healthy and complete?"
  */
 export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
+  // W2.2 (2026-09-14) — absolute per-source live-page floor (doctor.page_floors).
+  'page_floor',
   'abandoned_threads',
   'brain_score',
   'calibration_freshness',

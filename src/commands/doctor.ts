@@ -59,6 +59,7 @@ export {
   whoknowsHealthCheck,
   pgvectorCheck,
   pagesUpsertArbiterCheck,
+  pageFloorCheck,
   jsonbIntegrityCheck,
   checkVolunteerChannels,
   takesWeightGridCheck,
@@ -151,6 +152,7 @@ import {
   whoknowsHealthCheck,
   pgvectorCheck,
   pagesUpsertArbiterCheck,
+  pageFloorCheck,
   jsonbIntegrityCheck,
   checkVolunteerChannels,
   takesWeightGridCheck,
@@ -1763,6 +1765,12 @@ export async function buildChecks(
   // page write fails brain-wide and the version counter can't see the drift.
   progress.heartbeat('pages_upsert_arbiter');
   checks.push(await pagesUpsertArbiterCheck(engine));
+
+  // 4a-ter. W2.2 (2026-09-14): absolute per-source page floor. Ratio checks
+  // graded a brain that had just lost 1,139 pages as healthy; this one fails
+  // when a source's live count drops below its configured floor.
+  progress.heartbeat('page_floor');
+  checks.push(await pageFloorCheck(engine));
 
   // 4b. PgBouncer / prepared-statement compatibility.
   // URL-only inspection — no DB roundtrip — so this is cheap and works
