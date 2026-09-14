@@ -12,6 +12,12 @@ import { REPAIR_SOURCE_CONFIG_SQL } from '../../../core/source-config-sql.ts';
 import { loadConfig } from '../../../core/config.ts';
 import type { ProgressReporter } from '../../../core/progress.ts';
 import type { Check } from '../../doctor.ts';
+import {
+  PAGE_FLOORS_CONFIG_KEY,
+  parsePageFloors,
+  evaluatePageFloors,
+  formatPageFloorMessage,
+} from '../../../core/page-floor.ts';
 
 /**
  * Doctor check: takes.weight grid integrity (v0.32 — EXP-2).
@@ -714,3 +720,60 @@ export async function checkPgliteScratchProbe(opts: {
   }
 }
 
+
+
+/**
+ * W2.2 `page_floor` check: every source's live page count against its
+ * absolute floor in `doctor.page_floors`. FAILS on a breach (the plan's
+ * synthetic-hole readback), WARNS when no floors are configured (the blind
+ * state the check exists to end), FAILS on a malformed config (a broken floor
+ * must never read as healthy). Live sources without a floor are listed, never
+ * silently skipped. `sourceIds` scopes the report for source-bound remote
+ * callers.
+ */
+export async function pageFloorCheck(
+  engine: BrainEngine,
+  opts: { sourceIds?: string[] } = {},
+): Promise<Check> {
+  const name = 'page_floor';
+  let floors: Record<string, number> | null;
+  try {
+    floors = parsePageFloors(await engine.getConfig(PAGE_FLOORS_CONFIG_KEY));
+  } catch (e) {
+    return {
+      name,
+      status: 'fail',
+      message: `${e instanceof Error ? e.message : String(e)} — fix the config row; until then no floor is enforced.`,
+    };
+  }
+  let live: Record<string, number> = {};
+  try {
+    const rows = await engine.executeRaw<{ source_id: string; n: number | string }>(
+      `SELECT source_id, count(*)::int AS n FROM pages WHERE deleted_at IS NULL GROUP BY source_id`,
+    );
+    for (const r of rows) live[r.source_id] = Number(r.n);
+  } catch {
+    return { name, status: 'warn', message: 'Could not count live pages per source' };
+  }
+  if (floors === null) {
+    const scoped = opts.sourceIds
+      ? Object.fromEntries(Object.entries(live).filter(([k]) => opts.sourceIds!.includes(k)))
+      : live;
+    const list = Object.entries(scoped).map(([k, n]) => `${k} (${n})`).join(', ') || 'none';
+    return {
+      name,
+      status: 'warn',
+      message:
+        `No page floors configured (${PAGE_FLOORS_CONFIG_KEY}). Ratio checks cannot see a mass ` +
+        `deletion; set an absolute floor per source, e.g. 90% of today's live count. Live: ${list}.`,
+      details: { live: scoped },
+    };
+  }
+  const ev = evaluatePageFloors(floors, live, opts.sourceIds);
+  return {
+    name,
+    status: ev.status,
+    message: formatPageFloorMessage(ev),
+    details: { rows: ev.rows },
+  };
+}
