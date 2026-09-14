@@ -9,7 +9,7 @@
  */
 
 import type { Operation } from './contract.ts';
-import { enforceClientSlugFence, sourceScopeOpts } from './context.ts';
+import { enforceClientSlugFence, sourceScopeOpts, federatedSearchScope } from './context.ts';
 import { stripTakesFence } from '../takes-fence.ts';
 import { slugHiddenFromCaller } from '../search/private-visibility.ts';
 import { VERSION } from '../../version.ts';
@@ -126,9 +126,18 @@ const run_doctor: Operation = {
   handler: async (ctx) => {
     const { doctorReportRemote } = await import('../../commands/doctor.ts');
     // Source isolation (cross-model P1): a source-bound caller's report must
-    // not aggregate other sources' activity. Scope-aware checks (currently
-    // volunteer_channels) filter on these ids; unscoped ctx = brain-wide.
-    const scope = sourceScopeOpts(ctx);
+    // not aggregate other sources' activity. Scope-aware checks
+    // (volunteer_channels, page_floor) filter on these ids; unscoped ctx =
+    // brain-wide.
+    //
+    // W2.2 follow-up (2026-09-14): route through the SAME visibility set as
+    // get_page / search / resolve_slugs (#3242): grant > federated set >
+    // scalar source. A legacy access token with no grant used to collapse to
+    // its scalar `default`, so the remote doctor reported one source's page
+    // floor on a three-source brain while search on the same token saw all
+    // three. Widening stops at the federated set; a source-bound grant is
+    // still honoured as-is.
+    const scope = federatedSearchScope(ctx);
     const sourceIds = scope.sourceIds ?? (scope.sourceId ? [scope.sourceId] : undefined);
     return doctorReportRemote(ctx.engine, { sourceIds });
   },
