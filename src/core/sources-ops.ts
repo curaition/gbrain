@@ -922,6 +922,23 @@ export async function getSourceStatus(
 // ── recloneIfNeeded (used by sources.ts restore path) ──────────────────────
 
 /**
+ * Optional branch pin for a managed clone: `sources.config.branch`. When set,
+ * clones are created with `--branch <name>` so the managed working tree tracks
+ * that branch instead of the repository default (2026-09-15: the curaition
+ * code source must follow `staging`, the production branch, not `main`).
+ * `git pull` in sync follows whatever branch the clone is on, so this only
+ * needs to be honoured at clone time.
+ */
+export function getRemoteBranch(config: unknown): string | undefined {
+  const cfg =
+    typeof config === 'string'
+      ? (JSON.parse(config) as Record<string, unknown>)
+      : ((config ?? {}) as Record<string, unknown>);
+  const b = cfg.branch;
+  return typeof b === 'string' && /^[A-Za-z0-9._\/-]+$/.test(b) ? b : undefined;
+}
+
+/**
  * Re-clone a source's remote_url into its local_path if the clone is
  * missing on disk. Used by `gbrain sources restore` after an operator
  * autopurged $GBRAIN_HOME/clones/. Idempotent: returns false (didn't clone)
@@ -960,7 +977,7 @@ export async function recloneIfMissing(
   const rand = randomBytes(6).toString('hex');
   const tempDir = join(parent, `.gbrain-reclone-${basename(src.local_path)}-${rand}`);
   try {
-    cloneRepo(remoteUrl, tempDir);
+    cloneRepo(remoteUrl, tempDir, { branch: getRemoteBranch(src.config) });
   } catch (e) {
     rmSync(tempDir, { recursive: true, force: true });
     if (e instanceof GitOperationError) {
