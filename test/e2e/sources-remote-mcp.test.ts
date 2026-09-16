@@ -46,6 +46,8 @@ for ((i=1; i<=$#; i++)); do
   next="\${!next_idx:-}"
   if [ "$arg" = "clone" ]; then has_clone=1; fi
   if [ "$arg" = "remote" ] && [ "$next" = "get-url" ]; then has_remote_get_url=1; fi
+  # validateRepoState reads the STORED origin (no insteadOf expansion).
+  if [ "$arg" = "--get" ] && [ "$next" = "remote.origin.url" ]; then has_remote_get_url=1; fi
 done
 if [ "$has_clone" = "1" ]; then
   dest="\${@: -1}"

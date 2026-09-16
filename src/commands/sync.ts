@@ -768,8 +768,9 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           throw new Error(
             `Source "${opts.sourceId}" clone at ${repoPath} has a remote ` +
               `that differs from config.remote_url=${remoteUrl}. ` +
-              `Re-clone with: gbrain sources rebase-clone ${opts.sourceId} ` +
-              `(if available, else: sources remove + sources add).`,
+              `Fix the origin: git -C ${repoPath} remote set-url origin ${remoteUrl} ` +
+              `— or remove the clone directory; an owned clone is re-cloned ` +
+              `automatically on the next sync (else: sources remove + sources add).`,
           );
       }
     }

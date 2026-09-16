@@ -12,6 +12,7 @@ import {
   fetchRemote,
   GitOperationError,
   validateRepoState,
+  stripRemoteCredentials,
   buildGitEnv,
   GIT_ENV,
 } from '../src/core/git-remote.ts';
@@ -42,6 +43,7 @@ case "$mode" in
   fail) exit 1 ;;
   url-drift) echo "https://github.com/different/url" ;;
   url-match) echo "https://github.com/expected/url" ;;
+  url-token) echo "https://x-access-token:SECRET@github.com/expected/url" ;;
   *) ;;
 esac
 exit 0
@@ -66,7 +68,7 @@ function clearArgvLog(): void {
   writeFileSync(FAKE_GIT_LOG, '');
 }
 
-function setMode(mode: 'ok' | 'fail' | 'url-drift' | 'url-match'): void {
+function setMode(mode: 'ok' | 'fail' | 'url-drift' | 'url-match' | 'url-token'): void {
   writeFileSync(FAKE_GIT_MODE, mode);
 }
 
@@ -360,6 +362,21 @@ describe('pullRepo', () => {
 // validateRepoState — 6-state decision tree
 // ---------------------------------------------------------------------------
 
+describe('stripRemoteCredentials', () => {
+  test('removes user:token@ and leaves the rest byte-identical', () => {
+    expect(stripRemoteCredentials('https://x-access-token:SECRET@github.com/o/r.git')).toBe(
+      'https://github.com/o/r.git',
+    );
+  });
+  test('returns a bare URL unchanged', () => {
+    expect(stripRemoteCredentials('https://github.com/o/r.git')).toBe('https://github.com/o/r.git');
+  });
+  test('returns non-URL input unchanged', () => {
+    expect(stripRemoteCredentials('not a url')).toBe('not a url');
+    expect(stripRemoteCredentials('')).toBe('');
+  });
+});
+
 describe('validateRepoState', () => {
   const fixtureDir = join(FAKE_GIT_DIR, 'state-fixtures');
 
@@ -409,6 +426,51 @@ describe('validateRepoState', () => {
     await withEnv({ PATH: fakePath() }, async () => {
       expect(validateRepoState(p, 'https://github.com/expected/url')).toBe('healthy');
     });
+  });
+
+  test("reads the STORED origin (git config --get remote.origin.url), not the insteadOf-expanded get-url", async () => {
+    const p = join(fixtureDir, 'stored-origin-repo');
+    mkdirSync(join(p, '.git'), { recursive: true });
+    setMode('url-match');
+    await withEnv({ PATH: fakePath() }, async () => {
+      validateRepoState(p, 'https://github.com/expected/url');
+    });
+    const calls = readArgvLog();
+    const probe = calls.find((a) => a.includes('remote.origin.url'));
+    expect(probe).toBeDefined();
+    expect(probe!.slice(2)).toEqual(['config', '--get', 'remote.origin.url']);
+    expect(calls.some((a) => a.includes('get-url'))).toBe(false);
+  });
+
+  test("returns 'healthy' when the origin carries a token the remote_url does not", async () => {
+    const p = join(fixtureDir, 'token-origin-repo');
+    mkdirSync(join(p, '.git'), { recursive: true });
+    setMode('url-token');
+    await withEnv({ PATH: fakePath() }, async () => {
+      expect(validateRepoState(p, 'https://github.com/expected/url')).toBe('healthy');
+    });
+  });
+
+  test("real git: a host-level url.insteadOf token rewrite does not read as 'url-drift'", async () => {
+    // The production shape (Railway START_COMMAND): the clone stores the bare
+    // URL, the host injects a deploy token via a global insteadOf rewrite.
+    // `git remote get-url origin` expands the rewrite; the stored config does not.
+    const p = join(fixtureDir, 'insteadof-repo');
+    mkdirSync(p, { recursive: true });
+    execFileSync('git', ['-C', p, 'init', '-q']);
+    execFileSync('git', ['-C', p, 'remote', 'add', 'origin', 'https://github.com/expected/url.git']);
+    // Repo-local config stands in for the host's --global rewrite: get-url
+    // expands insteadOf from any config scope, and this keeps the test
+    // hermetic (no GIT_CONFIG_GLOBAL dependency on the runner's git).
+    execFileSync('git', [
+      '-C', p, 'config',
+      'url.https://x-access-token:SECRET@github.com/.insteadOf', 'https://github.com/',
+    ]);
+    // Sanity: the rewrite is active, so get-url really would have drifted.
+    const expanded = execFileSync('git', ['-C', p, 'remote', 'get-url', 'origin']).toString().trim();
+    expect(expanded).toBe('https://x-access-token:SECRET@github.com/expected/url.git');
+    expect(validateRepoState(p, 'https://github.com/expected/url.git')).toBe('healthy');
+    expect(validateRepoState(p, 'https://github.com/other/url.git')).toBe('url-drift');
   });
 
   test("returns 'healthy' when no expected URL provided (just probe)", async () => {
