@@ -318,10 +318,42 @@ export type RepoState =
   | 'corrupted';
 
 /**
+ * Strip userinfo (`user:token@`) from a remote URL so a credential-bearing
+ * form compares equal to the bare URL recorded in `sources.config.remote_url`.
+ * A clone can legitimately carry credentials in its origin (hand-cloned with a
+ * token URL) and, more insidiously, `git remote get-url` EXPANDS any
+ * `url.<base>.insteadOf` rewrite — the standard way to inject a deploy token
+ * on a host (`url."https://x-access-token:$T@github.com/".insteadOf
+ * "https://github.com/"`). Comparing the expanded string to the bare
+ * remote_url reported a permanent false `url-drift`, which performSync treats
+ * as a refusal: the hourly code sync on the curaition Railway host refused
+ * every tick for 32h (2026-09-15/16) while the stored origin was correct.
+ * Non-URL input is returned unchanged.
+ */
+export function stripRemoteCredentials(url: string): string {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return url;
+  }
+  if (!u.username && !u.password) return url;
+  u.username = '';
+  u.password = '';
+  return u.toString();
+}
+
+/**
  * Classify the on-disk state of a clone. Used by performSync to decide
  * whether to run pull (healthy), re-clone (missing/no-git/not-a-dir),
- * refuse with corruption error (corrupted), or refuse with rebase-clone
+ * refuse with corruption error (corrupted), or refuse with a re-clone
  * hint (url-drift).
+ *
+ * The origin is read as the STORED value (`git config --get remote.origin.url`),
+ * not `git remote get-url origin`: get-url applies `url.<base>.insteadOf`
+ * rewrites, so a host-level credential injection would make the clone look
+ * drifted from the bare remote_url it was cloned from. Both sides are also
+ * compared with credentials stripped (see stripRemoteCredentials).
  */
 export function validateRepoState(
   repoPath: string,
@@ -339,7 +371,7 @@ export function validateRepoState(
 
   let remoteUrl: string;
   try {
-    const out = execFileSync('git', ['-C', repoPath, 'remote', 'get-url', 'origin'], {
+    const out = execFileSync('git', ['-C', repoPath, 'config', '--get', 'remote.origin.url'], {
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 10_000,
       env: { ...process.env, ...GIT_ENV },
@@ -349,7 +381,10 @@ export function validateRepoState(
     return 'corrupted';
   }
 
-  if (expectedRemoteUrl !== undefined && remoteUrl !== expectedRemoteUrl) {
+  if (
+    expectedRemoteUrl !== undefined &&
+    stripRemoteCredentials(remoteUrl) !== stripRemoteCredentials(expectedRemoteUrl)
+  ) {
     return 'url-drift';
   }
   return 'healthy';
